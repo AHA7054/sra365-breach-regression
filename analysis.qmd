@@ -1,0 +1,328 @@
+---
+title: "What Drives the Cost of a Data Breach? A Regression Analysis"
+author: "Abdulaziz BinAbid"
+format: gfm
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This analysis comes from my work in SRA 365 (Statistics for Security and Risk Analysis) at Penn State. The data describe 500 simulated data breach incidents: how many records and people were affected, the share of sensitive data, how long the breach took to detect, how long its impact lasted, how much was spent on security controls, and the resulting financial loss.
+
+I work through six questions, moving from simple to more complex models:
+
+1. How are the key variables distributed, and is the data clean?
+2. Does detection time predict financial loss on its own?
+3. Do the assumptions of linear regression hold for that model?
+4. Which combination of factors best explains financial loss?
+5. Can the share of sensitive data predict whether a breach is detected quickly?
+6. Are the categorical versions of these factors associated with each other?
+
+A final section checks whether my conclusions hold up after removing rows that look like placeholder data.
+
+```{r setup}
+library(ggplot2)
+library(car)       # durbinWatsonTest, vif
+library(lmtest)    # bptest
+library(leaps)     # regsubsets
+library(gmodels)   # CrossTable
+library(knitr)
+
+theme_set(theme_minimal())
+
+fmt   <- function(x, d = 3) formatC(x, format = "f", digits = d)
+fmt_p <- function(p) if (p < 0.001) "< .001" else paste("=", fmt(p, 3))
+
+breach   <- read.delim("data/breaches.dat", header = TRUE)
+cat_data <- read.csv("data/breaches_categorical.csv", header = TRUE)
+
+predictors <- c("num_records", "dys_detect", "per_sensitive",
+                "cost_controls", "dys_impact", "num_people")
+```
+
+## 1. Distributions and data quality
+
+```{r descriptives}
+vars <- c("fin_loss", predictors)
+desc <- data.frame(
+  mean = sapply(breach[vars], mean),
+  sd   = sapply(breach[vars], sd),
+  min  = sapply(breach[vars], min),
+  max  = sapply(breach[vars], max)
+)
+kable(round(desc, 2))
+```
+
+```{r hist-loss}
+ggplot(breach, aes(fin_loss)) +
+  geom_histogram(bins = 30) +
+  labs(x = "Financial loss", y = "Number of incidents")
+```
+
+```{r outliers}
+breach$z_fin_loss <- as.numeric(scale(breach$fin_loss))
+extreme <- breach[abs(breach$z_fin_loss) > 3, c("event_ID", "fin_loss", "z_fin_loss")]
+kable(extreme, digits = 2, row.names = FALSE)
+```
+
+Several variables (financial loss, records, people) appear to be rescaled so they average about 50, so I describe effects in those scaled points rather than in dollars. Detection and impact are measured in days, and sensitive data is a percentage.
+
+Financial loss is roughly bell-shaped, with a slightly longer left tail. `r nrow(extreme)` incidents sit more than three standard deviations below the mean, with losses between `r fmt(min(extreme$fin_loss), 1)` and `r fmt(max(extreme$fin_loss), 1)`. Nothing suggests these are entry errors, so I keep them, but they come up again in the normality check. Detection time and the share of sensitive data are spread fairly evenly across their ranges, with no extreme values.
+
+### Placeholder values
+
+```{r placeholders}
+breach$placeholder   <- breach$num_people == 50 & breach$num_records == 50
+cat_data$placeholder <- cat_data$num_people == 50 & cat_data$num_records == 50
+
+n_placeholder <- sum(breach$placeholder)
+n_loss50      <- sum(breach$placeholder & breach$fin_loss == 50)
+n_cost50      <- sum(breach$cost_controls == 50)
+c(placeholder_rows = n_placeholder, of_which_loss_is_50 = n_loss50, cost_controls_exactly_50 = n_cost50)
+```
+
+While exploring the data, I noticed that `r n_placeholder` incidents have the number of people and the number of records both at exactly 50, and `r n_loss50` of them also have a financial loss of exactly 50. Since 50 is the center of the scale, this pattern looks like missing values filled in with a default rather than real observations. Cost of controls has the same problem on a larger scale: `r n_cost50` incidents are exactly 50. I keep these rows in the main analysis to match the course assignments, then test in Section 7 whether removing them changes my conclusions.
+
+## 2. Simple regression: detection time and financial loss
+
+```{r simple-reg}
+m_simple <- lm(fin_loss ~ dys_detect, data = breach)
+summary(m_simple)
+```
+
+```{r simple-plot}
+ggplot(breach, aes(dys_detect, fin_loss)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(x = "Days to detect", y = "Financial loss")
+```
+
+```{r simple-predict}
+new_case <- data.frame(dys_detect = 365)
+conf_int <- predict(m_simple, new_case, interval = "confidence", level = 0.85)
+pred_int <- predict(m_simple, new_case, interval = "prediction", level = 0.85)
+rbind(confidence = conf_int, prediction = pred_int)
+
+slope <- coef(m_simple)["dys_detect"]
+r2    <- summary(m_simple)$r.squared
+p_det <- summary(m_simple)$coefficients["dys_detect", "Pr(>|t|)"]
+```
+
+Detection time is a statistically significant predictor of financial loss (p `r fmt_p(p_det)`), but the effect is small. Each additional 100 days before detection adds about `r fmt(slope * 100, 2)` points of loss, and detection time explains only `r fmt(r2 * 100, 1)`% of the variation in loss. With 500 incidents, even a weak relationship reaches significance, so I read this result as "real but minor" rather than "important."
+
+For a breach that goes undetected for a full year, the model predicts a loss of `r fmt(pred_int[1, "fit"], 1)`. The 85% confidence interval (`r fmt(conf_int[1, "lwr"], 1)` to `r fmt(conf_int[1, "upr"], 1)`) estimates the *average* loss for all breaches detected after 365 days, so it is narrow. The 85% prediction interval (`r fmt(pred_int[1, "lwr"], 1)` to `r fmt(pred_int[1, "upr"], 1)`) covers a *single* breach, so it adds the scatter between individual incidents on top of that and comes out far wider. In practice, knowing detection time alone tells me very little about what any one breach will cost.
+
+## 3. Checking regression assumptions
+
+I check the assumptions of the model from Section 2.
+
+```{r assumptions}
+set.seed(365)                          # durbinWatsonTest uses a bootstrap p-value
+dw <- durbinWatsonTest(m_simple)       # independence of errors
+bp <- bptest(m_simple)                 # equal variance (Breusch-Pagan)
+sw <- shapiro.test(residuals(m_simple))  # normality of residuals
+dw; bp; sw
+```
+
+```{r assumption-plots, fig.height = 4}
+par(mfrow = c(1, 2))
+plot(m_simple, which = 1)  # residuals vs fitted
+plot(m_simple, which = 2)  # normal Q-Q
+par(mfrow = c(1, 1))
+```
+
+```{r std-resid}
+std_r <- rstandard(m_simple)
+beyond_2 <- mean(abs(std_r) > 2)
+beyond_3 <- sum(abs(std_r) > 3)
+c(share_beyond_2 = round(beyond_2, 3), count_beyond_3 = beyond_3)
+```
+
+- **Independence:** the Durbin-Watson statistic is `r fmt(dw$dw, 2)`, close to the ideal value of 2 (p `r fmt_p(dw$p)`). There is no evidence that errors are correlated across incidents.
+- **Equal variance:** the Breusch-Pagan test finds no heteroscedasticity (p `r fmt_p(bp$p.value)`), and the residuals in the residuals vs fitted plot form an even band without a funnel shape.
+- **Normality:** the Shapiro-Wilk test rejects normality (W = `r fmt(sw$statistic, 3)`, p `r fmt_p(sw$p.value)`). The Q-Q plot shows this comes from the lower tail, which matches the handful of unusually low losses from Section 1. With 500 observations, Shapiro-Wilk flags even small departures, and the coefficient tests are fairly robust at this sample size, so I treat this as a caution rather than a reason to throw out the model.
+- **Standardized residuals:** `r fmt(beyond_2 * 100, 1)`% fall beyond ±2, close to the 5% expected in a well-behaved model. `r beyond_3` fall beyond ±3, more than the one or two I would expect by chance. These are mostly the same extreme low-loss incidents.
+
+Overall, the model is usable, with the main concern being a heavier lower tail than a normal distribution would predict.
+
+## 4. Multiple regression and model selection
+
+### Best subsets
+
+```{r best-subsets}
+bs <- regsubsets(reformulate(predictors, "fin_loss"), data = breach,
+                 nbest = 1, nvmax = length(predictors))
+bs_sum <- summary(bs)
+
+bs_table <- data.frame(
+  size   = seq_along(bs_sum$adjr2),
+  adj_r2 = round(bs_sum$adjr2, 4),
+  vars   = apply(bs_sum$which[, -1, drop = FALSE], 1,
+                 function(r) paste(names(r)[r], collapse = " + "))
+)
+kable(bs_table, col.names = c("Predictors", "Adjusted R²", "Best model"))
+```
+
+```{r best-subsets-plot}
+ggplot(bs_table, aes(size, adj_r2)) +
+  geom_line() + geom_point() +
+  labs(x = "Number of predictors", y = "Adjusted R²")
+```
+
+### Hierarchical models
+
+Next, I add the predictors one at a time in the order best subsets selected them, and test whether each addition significantly improves the fit.
+
+```{r hierarchical}
+models <- lapply(seq_along(predictors), function(k)
+  lm(reformulate(predictors[1:k], "fin_loss"), data = breach))
+
+comparison <- data.frame(
+  model  = seq_along(models),
+  added  = predictors,
+  adj_r2 = sapply(models, function(m) round(summary(m)$adj.r.squared, 4)),
+  AIC    = sapply(models, function(m) round(AIC(m), 1))
+)
+kable(comparison, col.names = c("Model", "Predictor added", "Adjusted R²", "AIC"))
+
+aov_tab <- do.call(anova, models)   # F-test for each added predictor
+aov_tab
+f_p <- aov_tab$`Pr(>F)`
+```
+
+### Multicollinearity
+
+```{r collinearity}
+full <- models[[length(models)]]
+vif_full <- vif(full)
+data.frame(VIF = round(vif_full, 2), tolerance = round(1 / vif_full, 3))
+round(cor(breach[, predictors]), 2)
+
+m_final <- models[[2]]   # num_records + dys_detect
+summary(m_final)
+vif(m_final)
+```
+
+Best subsets and the hierarchical models agree on the order of importance. The number of records affected is by far the strongest predictor: on its own, it explains about `r round(summary(models[[1]])$r.squared * 100)`% of the variation in financial loss, many times more than detection time did in Section 2. Adjusted R² peaks at four predictors (`r fmt(max(bs_sum$adjr2), 3)`) and then falls, because the last two predictors add almost nothing.
+
+The F-tests give a stricter answer. After records, only detection time adds significant explanatory power (p `r fmt_p(f_p[2])`). The share of sensitive data (p `r fmt_p(f_p[3])`) and cost of controls (p `r fmt_p(f_p[4])`) do not reach significance, and impact duration and number of people contribute nothing. AIC is lowest at four predictors, but only about `r fmt(comparison$AIC[2] - comparison$AIC[4], 1)` points below the two-predictor model, which is too small a difference to matter. I would choose the **two-predictor model (records + detection time)**. It is simpler, every term in it is significant, and it gives up only about half a percentage point of adjusted R² compared to the best model.
+
+Multicollinearity explains why the number of people adds nothing. It correlates with the number of records at r = `r fmt(cor(breach$num_records, breach$num_people), 2)`, which pushes both VIFs above 6 in the full model (tolerance around 0.15). That is below the common cutoff of 10, but it means the two variables carry mostly the same information: once I know how many records leaked, the number of people affected is largely redundant. The chosen model avoids the problem, and its VIFs are close to 1.
+
+## 5. Logistic regression: predicting fast detection
+
+```{r logistic}
+cat_data$dys_detect_v2 <- factor(cat_data$dys_detect_v2)
+
+# Set the reference level BEFORE fitting; glm models the probability of the other level
+cat_data$dys_detect_v2 <- relevel(cat_data$dys_detect_v2, ref = "Slow")
+lv <- levels(cat_data$dys_detect_v2)
+table(cat_data$dys_detect_v2)
+
+m_logit <- glm(dys_detect_v2 ~ per_sensitive, data = cat_data, family = binomial)
+summary(m_logit)
+```
+
+```{r odds-ratios}
+or_table <- exp(cbind(odds_ratio = coef(m_logit), confint.default(m_logit)))
+round(or_table, 3)
+p_logit <- summary(m_logit)$coefficients["per_sensitive", "Pr(>|z|)"]
+```
+
+Predicted probabilities across the range of sensitive data, computed from the model:
+
+```{r logistic-predict}
+grid <- data.frame(per_sensitive = c(0, 25, 50, 75, 100))
+grid$prob_fast <- round(predict(m_logit, grid, type = "response"), 3)
+kable(grid, col.names = c("Percent sensitive", "P(fast detection)"))
+```
+
+```{r logistic-accuracy}
+predicted <- factor(ifelse(fitted(m_logit) > 0.5, lv[2], lv[1]), levels = lv)
+observed  <- model.frame(m_logit)$dys_detect_v2
+conf_mat  <- table(observed, predicted)
+conf_mat
+accuracy  <- sum(diag(conf_mat)) / sum(conf_mat)
+n_fast    <- sum(observed == "Fast")
+```
+
+The model estimates the probability that a breach is detected **Fast**, with Slow as the reference group. Only `r n_fast` of `r length(observed)` breaches (`r fmt(n_fast / length(observed) * 100, 0)`%) were detected fast.
+
+The share of sensitive data has no meaningful relationship with detection speed. The odds ratio is `r fmt(or_table["per_sensitive", 1], 3)` per percentage point (p `r fmt_p(p_logit)`), so the predicted probability of fast detection stays around `r fmt(grid$prob_fast[3] * 100, 0)`% whether a breach involves none or all sensitive data.
+
+The classification table shows a consequence worth pointing out. At a 0.5 cutoff, the model predicts every breach as slow, which gives an accuracy of `r fmt(accuracy * 100, 0)`%. That sounds strong, but it is exactly what I would get by always guessing "slow," and the model identifies zero of the fast detections. With imbalanced classes, accuracy is misleading. To evaluate a model like this properly, I would look at sensitivity for the minority class or adjust the cutoff instead.
+
+## 6. Associations between categorical factors
+
+```{r categorical}
+pairs <- list(
+  c("cost_controls_v2", "num_people_v2"),
+  c("cost_controls_v2", "per_sensitive_v2"),
+  c("dys_detect_v2",    "cost_controls_v2")
+)
+
+for (p in pairs) {
+  cat("\n\n=====", p[1], "by", p[2], "=====\n")
+  is_2x2 <- length(unique(cat_data[[p[1]]])) == 2 && length(unique(cat_data[[p[2]]])) == 2
+  CrossTable(cat_data[[p[1]]], cat_data[[p[2]]],
+             chisq = TRUE, fisher = is_2x2, expected = TRUE,
+             sresid = TRUE, format = "SPSS")
+}
+```
+
+```{r categorical-summary}
+chi_p <- function(df, p) suppressWarnings(
+  chisq.test(table(df[[p[1]]], df[[p[2]]]), correct = FALSE))
+
+chi_all <- lapply(pairs, function(p) chi_p(cat_data, p))
+chi_exc <- lapply(pairs, function(p) chi_p(cat_data[!cat_data$placeholder, ], p))
+
+# Fisher's exact test for the table with a small expected count
+set.seed(365)
+fisher_people <- fisher.test(table(cat_data$cost_controls_v2, cat_data$num_people_v2),
+                             simulate.p.value = TRUE, B = 1e5)
+
+kable(data.frame(
+  pair                 = sapply(pairs, paste, collapse = " × "),
+  chi_sq               = sapply(chi_all, function(x) round(x$statistic, 2)),
+  df                   = sapply(chi_all, function(x) x$parameter),
+  p_all_rows           = sapply(chi_all, function(x) round(x$p.value, 4)),
+  p_without_placeholders = sapply(chi_exc, function(x) round(x$p.value, 4))
+), row.names = FALSE)
+```
+
+On the full data, two of the three pairs show significant associations:
+
+- **Cost of controls × people affected:** χ²(`r chi_all[[1]]$parameter`) = `r fmt(chi_all[[1]]$statistic, 2)`, p `r fmt_p(chi_all[[1]]$p.value)`. One expected count is below 5 because only `r sum(cat_data$num_people_v2 == "Less than 30 million")` incidents affected fewer than 30 million people, so I also ran Fisher's exact test, which agrees (p `r fmt_p(fisher_people$p.value)`). The association is driven by high-control incidents being overrepresented among breaches affecting more than 60 million people (standardized residual above 1.96).
+- **Cost of controls × share of sensitive data:** χ²(`r chi_all[[2]]$parameter`) = `r fmt(chi_all[[2]]$statistic, 2)`, p `r fmt_p(chi_all[[2]]$p.value)`. High-control incidents are overrepresented among breaches with low sensitive data and underrepresented among those with moderate sensitive data.
+- **Detection speed × cost of controls:** no significant association (p `r fmt_p(chi_all[[3]]$p.value)`).
+
+These results need a caveat. The categorical version of cost of controls codes exactly 50 as "Low," and `r n_cost50` incidents sit at exactly 50. Most of the placeholder rows from Section 1 also fall in the "Moderate" sensitive data group. That combination inflates the Low-control, Moderate-sensitivity cell, which pushes down the share of high-control incidents in the Moderate group, one of the cells driving the second association. When I drop the `r n_placeholder` placeholder rows, the sensitive data association weakens considerably (p `r fmt_p(chi_exc[[2]]$p.value)`), and the people-affected association is no longer significant at .05 (p `r fmt_p(chi_exc[[1]]$p.value)`). I would not draw conclusions from either association without cleaner data.
+
+## 7. Sensitivity check: removing placeholder rows
+
+```{r sensitivity}
+m_clean <- lm(fin_loss ~ num_records + dys_detect, data = breach[!breach$placeholder, ])
+
+compare_fit <- function(m) c(
+  n              = nobs(m),
+  b_num_records  = coef(m)[["num_records"]],
+  b_dys_detect   = coef(m)[["dys_detect"]],
+  p_dys_detect   = summary(m)$coefficients["dys_detect", "Pr(>|t|)"],
+  r_squared      = summary(m)$r.squared
+)
+kable(round(rbind(all_rows = compare_fit(m_final), without_placeholders = compare_fit(m_clean)), 4))
+```
+
+Unlike the categorical results, the regression findings hold up. Without the placeholder rows, the coefficient for records and the significance of detection time barely change, and R² stays at about `r round(summary(m_clean)$r.squared * 100)`%. The placeholder rows sit at the center of the scale, so they add little to a linear fit, but they matter much more once continuous values are cut into categories.
+
+## Conclusions
+
+- **The scale of the breach drives its cost.** The number of records affected is by far the strongest predictor of financial loss. Detection time adds a small but reliable effect, and the share of sensitive data, cost of controls, impact duration and number of people add little or nothing once records are known.
+- **Detection time matters, but modestly.** On its own, it explains about 1% of the variation in loss. Faster detection is associated with lower loss, but it is far from the whole story.
+- **Sensitive data does not predict detection speed.** The logistic model performed no better than always guessing "slow," which also illustrates why accuracy alone is a poor metric for imbalanced outcomes.
+- **Data quality changes some conclusions.** About 16% of incidents look like placeholder rows. The regression results survive removing them, but the categorical associations mostly do not.
+
+**Limitations:** the data are simulated and appear to be rescaled, so effect sizes are in scaled units rather than dollars. The residuals have a heavier lower tail than a normal distribution. All of these relationships are correlational and do not show cause and effect.
